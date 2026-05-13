@@ -1,0 +1,996 @@
+---
+title: "CaseStudyCode_Log-rank_ADNI"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Including Packages
+```{r packages}
+library(survival)
+library(icenReg)
+library(parallel)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(energy)
+library(Icens)
+```
+
+
+## Data Loading
+```{r load_data}
+Y <- readRDS("ADNI_Y_Final.rds")
+
+stopifnot(all(c("PTID", "L_i", "R_i", "status") %in% colnames(Y)))
+cat("Outcome data loaded:", nrow(Y), "subjects\n")
+cat("Interval-censored (status=1):", sum(Y$status == 1),
+    sprintf("(%.1f%%)\n", 100 * mean(Y$status == 1)))
+cat("Right-censored    (status=0):", sum(Y$status == 0),
+    sprintf("(%.1f%%)\n", 100 * mean(Y$status == 0)))
+cat("L_i range:", round(range(Y$L_i, na.rm = TRUE), 2), "months\n")
+cat("R_i range (finite only):",
+    round(range(Y$R_i[is.finite(Y$R_i)], na.rm = TRUE), 2), "months\n")
+
+X_full <- readRDS("ADNI_X_Final.rds")
+stopifnot(is.matrix(X_full), all(X_full %in% c(0, 1, NA)))
+
+cat("\nSNP matrix loaded:", nrow(X_full), "subjects x",
+    ncol(X_full), "SNPs\n")
+
+stopifnot(identical(rownames(X_full), Y$PTID))
+cat("Row alignment check: PASSED (Y and X share the same ordered PTIDs)\n")
+
+align_to_half_month <- function(x) { round(x * 2) / 2 }
+
+Y$L_i <- align_to_half_month(Y$L_i)
+Y$R_i <- ifelse(is.infinite(Y$R_i), Inf, align_to_half_month(Y$R_i))
+
+conflict_idx <- which(Y$R_i <= Y$L_i)
+if (length(conflict_idx) > 0) {
+  Y$R_i[conflict_idx] <- Y$L_i[conflict_idx] + 0.5
+}
+
+cat("\nAfter 0.5-month coarsening:\n")
+cat("L_i unique values:", length(unique(Y$L_i)), "\n")
+cat("R_i unique values (finite):", length(unique(Y$R_i[is.finite(Y$R_i)])), "\n")
+```
+
+
+## Preprocessing
+```{r preprocess}
+snp_freq <- colMeans(X_full, na.rm = TRUE)
+snp_var  <- snp_freq * (1 - snp_freq)
+
+maf_pass <- snp_freq >= 0.01 & snp_freq <= 0.99
+cat("SNPs passing MAF >= 0.01 filter:", sum(maf_pass), "\n")
+
+snp_var_pass <- snp_var[maf_pass]
+p_keep       <- 8000
+top_idx      <- order(snp_var_pass, decreasing = TRUE)[seq_len(p_keep)]
+
+X_maf_temp  <- X_full[, maf_pass, drop = FALSE]
+X_topvar    <- X_maf_temp[, top_idx, drop = FALSE]
+snp_names   <- colnames(X_topvar)
+
+X_mat <- as.matrix(X_topvar)
+X_mat[is.na(X_mat)] <- 0L
+cat("SNPs retained after variance filter (p_keep):", ncol(X_mat), "\n")
+
+s       <- as.data.frame(X_mat)
+p_total <- ncol(s)
+cat("Final Phase I predictor matrix 'X_mat':", nrow(X_mat), "subjects x",
+    p_total, "SNPs\n")
+
+X_phase2 <- X_maf_temp
+storage.mode(X_phase2) <- "integer"
+X_phase2[is.na(X_phase2)] <- 0L
+snp_names_p2 <- colnames(X_phase2)
+cat("Phase II predictor matrix 'X_phase2':", nrow(X_phase2), "subjects x",
+    ncol(X_phase2), "SNPs\n")
+
+rm(X_full, X_maf_temp, X_topvar)
+gc()
+
+l         <- Y$L_i
+r         <- Y$R_i
+n_samples <- nrow(Y)
+
+n_interval <- sum(is.finite(r))
+n_right    <- sum(is.infinite(r))
+
+cat("\n=== Interval-Censoring Structure (ADNI, months) ===\n")
+cat(sprintf("  Interval-censored  (L_i, R_i]:  %d  (%.1f%%)\n",
+            n_interval, 100 * n_interval / n_samples))
+cat(sprintf("  Right-censored     (L_i,  Inf):  %d  (%.1f%%)\n",
+            n_right,    100 * n_right    / n_samples))
+
+is_right  <- is.infinite(r)
+is_int    <- !is_right
+width_int <- ifelse(is_int, r - l, 0)
+
+three <- ifelse(is_right, l, l + width_int / 3)
+mid   <- ifelse(is_right, l, l + width_int / 2)
+six   <- ifelse(is_right, l, l + 2 * width_int / 3)
+
+cat("\nProxy diagnostics:\n")
+cat("  Inf in 'mid':", sum(is.infinite(mid)),
+    "| NA in 'mid':", sum(is.na(mid)),
+    "| NA in 's':",   sum(is.na(s)), "\n")
+```
+
+
+## Screening Functions
+```{r core_functions}
+turnbull_em_npmle <- function(l, r, supp, max_iter = 1000, tol = 1e-10) {
+  n <- length(l); J <- length(supp)
+  alpha <- matrix(0.0, n, J)
+  for (i in seq_len(n)) {
+    li <- l[i]; ri <- r[i]
+    if      ( is.finite(li) &&  is.finite(ri)) alpha[i, supp >  li & supp <= ri] <- 1.0
+    else if ( is.finite(li) && !is.finite(ri)) alpha[i, supp >  li              ] <- 1.0
+    else if (!is.finite(li) &&  is.finite(ri)) alpha[i,               supp <= ri] <- 1.0
+  }
+  covered <- colSums(alpha) > 0
+  if (!any(covered)) return(rep(0.0, J))
+  alpha_c <- alpha[, covered, drop = FALSE]
+  Jc      <- sum(covered)
+  p       <- rep(1.0 / Jc, Jc)
+  for (iter in seq_len(max_iter)) {
+    p_old <- p
+    denom <- as.vector(alpha_c %*% p)
+    denom[denom < 1e-14] <- 1e-14
+    w     <- sweep(alpha_c * matrix(p, n, Jc, byrow = TRUE), 1, denom, "/")
+    p     <- colMeans(w)
+    if (max(abs(p - p_old)) < tol) break
+  }
+  p_full          <- numeric(J)
+  p_full[covered] <- p
+  p_full
+}
+
+precompute_logrank_globals <- function(l, r) {
+  n     <- length(l)
+  supp  <- sort(unique(c(l[is.finite(l)], r[is.finite(r)])))
+  p_hat <- turnbull_em_npmle(l, r, supp)
+  active  <- p_hat > 1e-14
+  supp_a  <- supp[active]
+  p_hat_a <- p_hat[active] / sum(p_hat[active])
+  Ja      <- length(supp_a)
+  alpha   <- matrix(0L, n, Ja)
+  for (i in seq_len(n)) {
+    li <- l[i]; ri <- r[i]
+    if      ( is.finite(li) &&  is.finite(ri)) alpha[i, supp_a >  li & supp_a <= ri] <- 1L
+    else if ( is.finite(li) && !is.finite(ri)) alpha[i, supp_a >  li               ] <- 1L
+    else if (!is.finite(li) &&  is.finite(ri)) alpha[i,                supp_a <= ri] <- 1L
+  }
+  denom <- as.vector(alpha %*% p_hat_a)
+  denom[denom < 1e-14] <- 1e-14
+  w     <- sweep(alpha * matrix(p_hat_a, n, Ja, byrow = TRUE), 1, denom, "/")
+  d_j   <- colSums(w)
+  n_j   <- rev(cumsum(rev(d_j)))
+  list(supp = supp_a, p_hat = p_hat_a, alpha = alpha,
+       w = w, d_j = d_j, n_j = n_j, J = Ja, n = n)
+}
+
+
+screen_logrank_raw <- function(no, x_mat, g) {
+  x_k <- x_mat[, no]
+  if (sum(x_k) < 2 || sum(1 - x_k) < 2) return(0)
+  d_jk <- colSums(x_k * g$w)
+  n_jk <- rev(cumsum(rev(d_jk)))
+  ok   <- g$n_j > 1e-9
+  if (sum(ok) == 0) return(0)
+  U_n     <- sum(d_jk[ok] - g$d_j[ok] * (n_jk[ok] / g$n_j[ok])) / g$n
+  p_hat_k <- mean(x_k)
+  abs(U_n) / (p_hat_k * (1 - p_hat_k) + 1e-8)
+}
+
+screen_add_adni <- function(no, x_mat, l, r) {
+  x_k  <- x_mat[, no]
+  idx1 <- which(x_k == 1); idx0 <- which(x_k == 0)
+  if (length(idx1) < 2 || length(idx0) < 2) return(0)
+  supp_all <- sort(unique(c(l[is.finite(l) & l > 0], r[is.finite(r)])))
+  M <- length(supp_all); if (M == 0) return(0)
+  denom_w <- max(supp_all) - min(supp_all); if (denom_w <= 0) return(0)
+  p1 <- tryCatch(turnbull_em_npmle(l[idx1], r[idx1], supp_all), error = function(e) rep(0, M))
+  p0 <- tryCatch(turnbull_em_npmle(l[idx0], r[idx0], supp_all), error = function(e) rep(0, M))
+  sum(abs(cumsum(p1) - cumsum(p0)) * diff(c(0, supp_all))) / denom_w
+}
+
+Fk <- function(X0, x) vapply(x, function(xi) sum(X0 <= xi) / length(X0), numeric(1))
+
+Fkr <- function(X0, Y, yr, x) {
+  ind_yr <- (Y == yr)
+  vapply(x, function(xi) sum((X0 <= xi) * ind_yr) / sum(ind_yr), numeric(1))
+}
+
+MV <- function(Xk, Y) {
+  Fk0 <- Fk(Xk, Xk); Yr <- unique(Y)
+  sum(vapply(Yr, function(yr) {
+    (sum(Y == yr) / length(Y)) * mean((Fkr(Xk, Y, yr, Xk) - Fk0)^2)
+  }, numeric(1)))
+}
+
+screen_ks <- function(i, y, x_mat) {
+  x_k <- x_mat[, i]; part1 <- y[x_k == 0]; part2 <- y[x_k == 1]
+  if (length(part1) < 2 || length(part2) < 2) return(0)
+  suppressWarnings(as.numeric(ks.test(part1, part2)$statistic))
+}
+
+screen_dc <- function(i, y, x_mat) {
+  x_k <- x_mat[, i]; if (var(x_k) == 0) return(0)
+  tryCatch(dcor(y, x_k), error = function(e) 0)
+}
+
+screen_mv <- function(i, y, x_mat) {
+  x_k <- x_mat[, i]; if (var(x_k) == 0) return(0)
+  abs(MV(Y = x_k, Xk = y))
+}
+```
+
+
+## Phase I Screening (Table 9)
+```{r screening, warning=FALSE}
+X_mat <- as.matrix(s)
+
+cat("Pre-computing global NPMLE for Log-rank SIS...\n")
+a <- Sys.time()
+logrank_globals_adni <- precompute_logrank_globals(l, r)
+cat(sprintf("  Done in %.1f sec\n", as.numeric(Sys.time() - a, units = "secs")))
+
+cat("Running Log-rank SIS [Phase I]...\n")
+a <- Sys.time()
+score_lr    <- sapply(seq_len(p_total), screen_logrank_raw, x_mat = X_mat, g = logrank_globals_adni)
+res_lr_adni <- data.frame(screen = score_lr)
+b <- Sys.time(); print(b - a)
+
+cat("Running ADD-SIS [Phase I]...\n")
+a <- Sys.time()
+score_add    <- sapply(seq_len(p_total), screen_add_adni, x_mat = X_mat, l = l, r = r)
+res_add_adni <- data.frame(screen = score_add)
+b <- Sys.time(); print(b - a)
+
+cat("Running single-point methods (midpoint proxy M2) [Phase I]...\n")
+a <- Sys.time()
+score2    <- sapply(seq_len(p_total), screen_ks, y = mid, x_mat = X_mat)
+res_ks_m2 <- data.frame(screen = score2); b <- Sys.time()
+print("KS-Filter-M2"); print(b - a)
+
+a <- Sys.time()
+score3    <- sapply(seq_len(p_total), screen_dc, y = mid, x_mat = X_mat)
+res_dc_m2 <- data.frame(screen = score3); b <- Sys.time()
+print("DC-SIS-M2"); print(b - a)
+
+a <- Sys.time()
+score4    <- sapply(seq_len(p_total), screen_mv, y = mid, x_mat = X_mat)
+res_mv_m2 <- data.frame(screen = score4); b <- Sys.time()
+print("MV-SIS-M2"); print(b - a)
+
+# M1 (1/3 proxy)
+a <- Sys.time()
+score5    <- sapply(seq_len(p_total), screen_ks, y = three, x_mat = X_mat)
+res_ks_m1 <- data.frame(screen = score5); b <- Sys.time()
+print("KS-Filter-M1"); print(b - a)
+
+a <- Sys.time()
+score6    <- sapply(seq_len(p_total), screen_dc, y = three, x_mat = X_mat)
+res_dc_m1 <- data.frame(screen = score6); b <- Sys.time()
+print("DC-SIS-M1"); print(b - a)
+
+a <- Sys.time()
+score7    <- sapply(seq_len(p_total), screen_mv, y = three, x_mat = X_mat)
+res_mv_m1 <- data.frame(screen = score7); b <- Sys.time()
+print("MV-SIS-M1"); print(b - a)
+
+# M3 (2/3 proxy)
+a <- Sys.time()
+score8    <- sapply(seq_len(p_total), screen_ks, y = six, x_mat = X_mat)
+res_ks_m3 <- data.frame(screen = score8); b <- Sys.time()
+print("KS-Filter-M3"); print(b - a)
+
+a <- Sys.time()
+score9    <- sapply(seq_len(p_total), screen_dc, y = six, x_mat = X_mat)
+res_dc_m3 <- data.frame(screen = score9); b <- Sys.time()
+print("DC-SIS-M3"); print(b - a)
+
+a <- Sys.time()
+score10   <- sapply(seq_len(p_total), screen_mv, y = six, x_mat = X_mat)
+res_mv_m3 <- data.frame(screen = score10); b <- Sys.time()
+print("MV-SIS-M3"); print(b - a)
+```
+
+
+## Phase II Genome-Wide Screening
+```{r phase2_screening, warning=FALSE}
+p_total_p2 <- ncol(X_phase2)
+cat("=== Phase II: Genome-Wide Screening ===\n")
+cat("Total SNPs (Phase II):", p_total_p2, "\n\n")
+
+cat("Running Log-rank SIS [Phase II, p =", p_total_p2, "]...\n")
+cat("  (Estimated time: ~", round(p_total_p2 / 8000 * 2.3 / 60, 1),
+    "min based on Phase I benchmark)\n")
+a <- Sys.time()
+score_lr_p2 <- sapply(seq_len(p_total_p2), screen_logrank_raw,
+                      x_mat = X_phase2, g = logrank_globals_adni)
+res_lr_p2 <- data.frame(screen = score_lr_p2, row.names = snp_names_p2)
+b <- Sys.time()
+cat("Log-rank SIS [Phase II] done in:"); print(b - a)
+
+cat("\nRunning KS-Filter-M2 [Phase II]...\n")
+a <- Sys.time()
+score_ks_p2 <- sapply(seq_len(p_total_p2), screen_ks,
+                      y = mid, x_mat = X_phase2)
+res_ks_p2 <- data.frame(screen = score_ks_p2, row.names = snp_names_p2)
+b <- Sys.time()
+cat("KS-Filter-M2 [Phase II] done in:"); print(b - a)
+
+cat("\nRunning DC-SIS-M2 [Phase II]...\n")
+cat("  (Estimated time: ~", round(p_total_p2 / 8000 * 15.4 / 60, 1),
+    "min based on Phase I benchmark)\n")
+a <- Sys.time()
+score_dc_p2 <- sapply(seq_len(p_total_p2), screen_dc,
+                      y = mid, x_mat = X_phase2)
+res_dc_p2 <- data.frame(screen = score_dc_p2, row.names = snp_names_p2)
+b <- Sys.time()
+cat("DC-SIS-M2 [Phase II] done in:"); print(b - a)
+
+cat("\nRunning MV-SIS-M2 [Phase II]...\n")
+a <- Sys.time()
+score_mv_p2 <- sapply(seq_len(p_total_p2), screen_mv,
+                      y = mid, x_mat = X_phase2)
+res_mv_p2 <- data.frame(screen = score_mv_p2, row.names = snp_names_p2)
+b <- Sys.time()
+cat("MV-SIS-M2 [Phase II] done in:"); print(b - a)
+
+cat("\n=== Phase II Speed Benchmark Summary ===\n")
+cat(sprintf("  Log-rank SIS  (Phase II, p=%d): see above\n", p_total_p2))
+cat(sprintf("  KS-Filter-M2  (Phase II, p=%d): see above\n", p_total_p2))
+cat(sprintf("  DC-SIS-M2     (Phase II, p=%d): see above\n", p_total_p2))
+cat(sprintf("  MV-SIS-M2     (Phase II, p=%d): see above\n", p_total_p2))
+```
+
+
+## IC-Cox Global Goodness-of-Fit — Phase I (Table 10)
+```{r part5_functions}
+get_robust_formula_and_data <- function(train_data, test_data = NULL) {
+  X_train   <- train_data[, 3:ncol(train_data), drop = FALSE]
+  col_means <- apply(X_train, 2, mean, na.rm = TRUE)
+  keep_idx  <- which(col_means > 0.005 & col_means < 0.995)
+  X_train   <- X_train[, keep_idx, drop = FALSE]
+
+  if (ncol(X_train) > 0) {
+    X_for_qr   <- cbind(Intercept = 1, as.matrix(X_train))
+    q          <- qr(X_for_qr)
+    indep_cols <- q$pivot[seq_len(q$rank)] - 1
+    indep_cols <- indep_cols[indep_cols > 0]
+    final_vars <- colnames(X_train)[indep_cols]
+  } else {
+    final_vars <- character(0)
+  }
+
+  fml_str <- if (length(final_vars) == 0) {
+    "cbind(l, r) ~ 1"
+  } else {
+    paste("cbind(l, r) ~", paste(final_vars, collapse = " + "))
+  }
+  res <- list(fml = as.formula(fml_str), k = length(final_vars))
+  if (!is.null(test_data)) res$test <- test_data[, final_vars, drop = FALSE]
+  return(res)
+}
+
+adni_prepare <- function(res, sub) {
+  totno <- ncol(s)
+  ks    <- data.frame(rank  = totno - rank(res$screen),
+                      index = seq_len(totno))
+  x     <- as.matrix(s[, ks[ks$rank < sub + 1, ]$index, drop = FALSE])
+  data.frame(l = l, r = r,
+             sapply(seq_len(ncol(x)), function(i) x[, i]))
+}
+
+model_fitting_cox_adni <- function(data) {
+  dt_tmp   <- data
+  dt_tmp$l <- log(pmax(data$l, 0.5))
+  dt_tmp$r <- log(data$r)
+
+  rob <- get_robust_formula_and_data(dt_tmp)
+
+  fit_full <- suppressWarnings(tryCatch(
+    ic_sp(rob$fml, data = dt_tmp, model = "ph"),
+    error = function(e) NULL
+  ))
+  if (is.null(fit_full) || is.na(fit_full$llk))
+    return(rep(NA_real_, 4))
+
+  fit_null <- suppressWarnings(tryCatch(
+    ic_sp(cbind(l, r) ~ 1, data = dt_tmp, model = "ph"),
+    error = function(e) NULL
+  ))
+
+  ll    <- as.numeric(fit_full$llk)
+  n     <- nrow(data)
+  k     <- rob$k
+  aic   <- -2 * ll + 2 * k
+  bic   <- -2 * ll + k * log(n)
+  chisq <- if (!is.null(fit_null)) {
+    2 * (ll - as.numeric(fit_null$llk))
+  } else NA_real_
+  c(ll, aic, bic, chisq)
+}
+
+gof_cox_table_adni <- function(sub) {
+  cat("Fitting IC-Cox on Phase I data — d =", sub, "\n")
+  results <- rbind(
+    model_fitting_cox_adni(adni_prepare(res_add_adni, sub)),
+    model_fitting_cox_adni(adni_prepare(res_lr_adni,  sub)),
+    model_fitting_cox_adni(adni_prepare(res_ks_m1,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_dc_m1,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_mv_m1,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_ks_m2,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_dc_m2,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_mv_m2,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_ks_m3,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_dc_m3,    sub)),
+    model_fitting_cox_adni(adni_prepare(res_mv_m3,    sub))
+  )
+  df <- data.frame(results,
+                   row.names = c("ADD-SIS", "Log-rank SIS",
+                                 "KS-Filter-M1", "DC-SIS-M1", "MV-SIS-M1",
+                                 "KS-Filter-M2", "DC-SIS-M2", "MV-SIS-M2",
+                                 "KS-Filter-M3", "DC-SIS-M3", "MV-SIS-M3"))
+  colnames(df) <- c("LogLik", "AIC", "BIC", "ChiSq")
+  df
+}
+```
+
+```{r part5_run, warning=FALSE}
+cat("=== IC-Cox Global GoF | Phase I | d = 50 ===\n")
+gof_50 <- gof_cox_table_adni(50)
+print(round(gof_50, 4))
+```
+
+
+## IC-Cox Robustness Across d Values (Figure 3)
+```{r robustness_d, warning=FALSE}
+cat("=== Robustness Analysis: IC-Cox GoF across d values ===\n\n")
+
+d_extra <- c(15, 30, 60)
+
+for (dv in d_extra) {
+  cat(sprintf("--- d = %d ---\n", dv))
+  gof_dv <- gof_cox_table_adni(dv)
+  print(round(gof_dv, 4))
+  cat("\n")
+}
+
+cat("=== Compact Robustness Table: Log-rank SIS vs ADD-SIS ===\n")
+cat(sprintf("  %-6s  %-10s %-10s %-10s %-10s\n",
+            "d", "LR-AIC", "LR-BIC", "ADD-AIC", "ADD-BIC"))
+
+for (dv in c(15, 30, 50, 60)) {
+  gv <- gof_cox_table_adni(dv)
+  cat(sprintf("  %-6d  %-10.3f %-10.3f %-10.3f %-10.3f\n",
+              dv,
+              gv["Log-rank SIS", "AIC"], gv["Log-rank SIS", "BIC"],
+              gv["ADD-SIS",      "AIC"], gv["ADD-SIS",      "BIC"]))
+}
+```
+
+
+## IC-Cox on Genome-Wide Top-d SNPs (Table 12)
+```{r phase2_gof, warning=FALSE}
+adni_prepare_p2 <- function(score_vec, sub) {
+  top_idx <- order(score_vec, decreasing = TRUE)[seq_len(sub)]
+  x       <- as.matrix(X_phase2[, top_idx, drop = FALSE])
+  data.frame(l = l, r = r,
+             sapply(seq_len(ncol(x)), function(i) x[, i]))
+}
+
+d_gw <- 50 
+
+cat("=== Phase II IC-Cox GoF | d =", d_gw, "===\n\n")
+
+cat("Fitting IC-Cox: Log-rank SIS [Phase II]...\n")
+gof_lr_p2 <- model_fitting_cox_adni(adni_prepare_p2(score_lr_p2, d_gw))
+cat(sprintf("  LogLik: %.3f | AIC: %.3f | BIC: %.3f | ChiSq: %.3f\n\n",
+            gof_lr_p2[1], gof_lr_p2[2], gof_lr_p2[3], gof_lr_p2[4]))
+
+cat("Fitting IC-Cox: KS-Filter-M2 [Phase II]...\n")
+gof_ks_p2 <- model_fitting_cox_adni(adni_prepare_p2(score_ks_p2, d_gw))
+cat(sprintf("  LogLik: %.3f | AIC: %.3f | BIC: %.3f | ChiSq: %.3f\n\n",
+            gof_ks_p2[1], gof_ks_p2[2], gof_ks_p2[3], gof_ks_p2[4]))
+
+cat("Fitting IC-Cox: DC-SIS-M2 [Phase II]...\n")
+gof_dc_p2 <- model_fitting_cox_adni(adni_prepare_p2(score_dc_p2, d_gw))
+cat(sprintf("  LogLik: %.3f | AIC: %.3f | BIC: %.3f | ChiSq: %.3f\n\n",
+            gof_dc_p2[1], gof_dc_p2[2], gof_dc_p2[3], gof_dc_p2[4]))
+
+cat("Fitting IC-Cox: MV-SIS-M2 [Phase II]...\n")
+gof_mv_p2 <- model_fitting_cox_adni(adni_prepare_p2(score_mv_p2, d_gw))
+cat(sprintf("  LogLik: %.3f | AIC: %.3f | BIC: %.3f | ChiSq: %.3f\n\n",
+            gof_mv_p2[1], gof_mv_p2[2], gof_mv_p2[3], gof_mv_p2[4]))
+
+gof_p2_df <- data.frame(
+  LogLik = c(gof_lr_p2[1], gof_ks_p2[1], gof_dc_p2[1], gof_mv_p2[1]),
+  AIC    = c(gof_lr_p2[2], gof_ks_p2[2], gof_dc_p2[2], gof_mv_p2[2]),
+  BIC    = c(gof_lr_p2[3], gof_ks_p2[3], gof_dc_p2[3], gof_mv_p2[3]),
+  ChiSq  = c(gof_lr_p2[4], gof_ks_p2[4], gof_dc_p2[4], gof_mv_p2[4]),
+  row.names = c("Log-rank SIS", "KS-Filter-M2", "DC-SIS-M2", "MV-SIS-M2")
+)
+cat("=== Phase II IC-Cox Summary (d =", d_gw, ") ===\n")
+print(round(gof_p2_df, 4))
+
+cat("\n=== Phase II: Top 5 Log-rank SIS SNPs (candidates for literature search) ===\n")
+rank_lr_p2   <- rank(-score_lr_p2)
+top5_p2_idx  <- order(score_lr_p2, decreasing = TRUE)[1:5]
+top5_p2_snps <- snp_names_p2[top5_p2_idx]
+top5_p2_df   <- data.frame(
+  Rank  = 1:5,
+  SNP   = top5_p2_snps,
+  Score = round(score_lr_p2[top5_p2_idx], 6),
+  MAF   = round(pmin(colMeans(X_phase2[, top5_p2_idx, drop = FALSE]),
+                     1 - colMeans(X_phase2[, top5_p2_idx, drop = FALSE])), 4)
+)
+print(top5_p2_df)
+cat("\nNote: Search GWAS Catalog (https://www.ebi.ac.uk/gwas/) or NCBI dbSNP\n")
+cat("using query: '<rs_id> Alzheimer' or '<rs_id> cognitive decline'\n")
+```
+
+## IC-Cox LOOCV — Helper Functions
+```{r loocv_functions}
+supreme_test <- function(x, ecdf, npmle) {
+  if (is.na(x)) return(NA)
+  abs(sum(npmle[[3]][x < npmle[[1]]], na.rm = TRUE) -
+        mean(x < ecdf, na.rm = TRUE))
+}
+
+cvm_test <- function(x, ecdf, npmle) {
+  if (is.na(x)) return(NA)
+  abs(sum(npmle[[3]][x < npmle[[1]]], na.rm = TRUE) -
+        mean(x < ecdf, na.rm = TRUE))^2
+}
+
+overlap1 <- function(a, b, d, e) {
+  if (any(is.na(c(a, b, d, e)))) return(NA_real_)
+  if (d >= b || e <= a) return(0)
+  overlap_len <- max(0, min(b, e) - max(a, d))
+  pred_width  <- e - d
+  if (pred_width <= 0) return(0)
+  overlap_len / pred_width
+}
+
+overlap2 <- function(a, b, d, e) {
+  if (any(is.na(c(a, b, d, e)))) return(NA_real_)
+  if (d >= b || e <= a) return(0)
+  overlap_len <- max(0, min(b, e) - max(a, d))
+  true_width  <- b - a
+  if (is.infinite(true_width) || true_width <= 0) return(0)
+  overlap_len / true_width
+}
+
+cv_cox_adni <- function(no, data) {
+  train     <- data[-no, ]
+  test_pred <- data[no, 3:ncol(data), drop = FALSE]
+
+  max_r_scale <- max(data$r[is.finite(data$r)], na.rm = TRUE)
+
+  train$l <- log(pmax(train$l, 0.5))
+  train$r <- log(train$r)
+
+  rob <- get_robust_formula_and_data(train, test_pred)
+
+  fit <- suppressWarnings(tryCatch(
+    ic_sp(rob$fml, data = train, model = "ph"),
+    error = function(e) NULL
+  ))
+
+  y_med <- NA_real_; y_l <- NA_real_; y_r <- NA_real_
+
+  if (!is.null(fit)) {
+    q_lower <- suppressWarnings(tryCatch(
+      as.numeric(getFitEsts(fit, newdata = rob$test, p = 0.025)),
+      error = function(e) NA_real_))
+    q_med   <- suppressWarnings(tryCatch(
+      as.numeric(getFitEsts(fit, newdata = rob$test, p = 0.500)),
+      error = function(e) NA_real_))
+    q_upper <- suppressWarnings(tryCatch(
+      as.numeric(getFitEsts(fit, newdata = rob$test, p = 0.975)),
+      error = function(e) NA_real_))
+
+    if (!is.na(q_lower)) y_l   <- exp(q_lower)
+    if (!is.na(q_med))   y_med <- exp(q_med)
+    if (!is.na(q_upper)) y_r   <- exp(q_upper)
+  }
+
+  y_l   <- if (is.na(y_l)   || is.infinite(y_l))   0           else max(0, y_l)
+  y_r   <- if (is.na(y_r)   || is.infinite(y_r))   max_r_scale else min(max_r_scale, y_r)
+  if (y_l > y_r) { tmp <- y_l; y_l <- y_r; y_r <- tmp }
+  y_med <- if (is.na(y_med) || is.infinite(y_med)) (y_l + y_r) / 2 else y_med
+
+  return(c(median = y_med, lower = y_l, upper = y_r))
+}
+```
+
+
+## IC-Cox LOOCV — Evaluation Metrics (Table 11)
+```{r loocv_engine, warning=FALSE}
+run_parallel_loocv_adni <- function(sub) {
+  cat("Initializing Parallel LOOCV for d =", sub, "...\n")
+
+  methods_data <- list(
+    "ADD-SIS"      = adni_prepare(res_add_adni, sub),
+    "Log-rank SIS" = adni_prepare(res_lr_adni,  sub),
+    "KS-Filter-M1" = adni_prepare(res_ks_m1,    sub),
+    "DC-SIS-M1"    = adni_prepare(res_dc_m1,    sub),
+    "MV-SIS-M1"    = adni_prepare(res_mv_m1,    sub),
+    "KS-Filter-M2" = adni_prepare(res_ks_m2,    sub),
+    "DC-SIS-M2"    = adni_prepare(res_dc_m2,    sub),
+    "MV-SIS-M2"    = adni_prepare(res_mv_m2,    sub),
+    "KS-Filter-M3" = adni_prepare(res_ks_m3,    sub),
+    "DC-SIS-M3"    = adni_prepare(res_dc_m3,    sub),
+    "MV-SIS-M3"    = adni_prepare(res_mv_m3,    sub)
+  )
+
+  n_obs <- nrow(methods_data[[1]])
+  cores <- max(1, detectCores() - 1)
+  cl    <- makeCluster(cores)
+  on.exit(stopCluster(cl))
+
+  clusterEvalQ(cl, { library(icenReg); library(survival) })
+  clusterExport(cl, c("cv_cox_adni", "get_robust_formula_and_data"),
+                envir = environment())
+
+  all_results <- lapply(names(methods_data), function(m_name) {
+    cat("  -> Processing:", m_name, "\n")
+    parSapply(cl, seq_len(n_obs), cv_cox_adni,
+              data = methods_data[[m_name]])
+  })
+
+  names(all_results) <- names(methods_data)
+  all_results
+}
+```
+
+```{r compute_metrics, warning=FALSE}
+est_adni <- EMICM(cbind(l, r))
+
+est_pdf_adni <- data.frame(
+  X1 = t(est_adni$intmap)[, 1],
+  X2 = t(est_adni$intmap)[, 2],
+  X3 = est_adni$pf
+)
+
+max_r_adni <- max(r[is.finite(r)], na.rm = TRUE)
+est_pdf_adni$X2[is.infinite(est_pdf_adni$X2)] <- max_r_adni
+est_pdf_adni$X2 <- pmax(est_pdf_adni$X1, est_pdf_adni$X2)
+
+int_split_adni <- function(i, df) {
+  x1_val <- floor(df$X1[i] / 0.5) * 0.5
+  x2_val <- ceiling(df$X2[i] / 0.5) * 0.5
+
+  if (x1_val >= x2_val) {
+    return(data.frame(x1 = x1_val, x2 = x1_val, x3 = df$X3[i]))
+  }
+
+  pts <- seq(x1_val, x2_val, by = 0.5)
+  data.frame(x1 = pts, x2 = pts, x3 = df$X3[i] / length(pts))
+}
+
+npmle_pdf_adni <- bind_rows(lapply(seq_len(nrow(est_pdf_adni)),
+                                   int_split_adni, df = est_pdf_adni))
+
+loo_com_method_adni <- function(res_tmp) {
+  get_ks <- function(preds) {
+    eval_pts <- c(preds, unique(c(est_pdf_adni$X1, est_pdf_adni$X2)))
+    eval_pts <- eval_pts[!is.na(eval_pts)]
+    max(sapply(eval_pts, supreme_test,
+               ecdf = preds, npmle = npmle_pdf_adni), na.rm = TRUE)
+  }
+  get_cvm <- function(preds) {
+    eval_pts <- c(preds, unique(c(est_pdf_adni$X1, est_pdf_adni$X2)))
+    eval_pts <- eval_pts[!is.na(eval_pts)]
+    n_valid  <- sum(!is.na(preds))
+    M_len    <- length(unique(c(est_pdf_adni$X1, est_pdf_adni$X2)))
+    r2       <- (n_valid * M_len) / (n_valid + M_len)
+    r2 * mean(sapply(eval_pts, cvm_test,
+                     ecdf = preds, npmle = npmle_pdf_adni), na.rm = TRUE)
+  }
+
+  s1 <- c(get_ks(res_tmp$x1),  get_ks(res_tmp$x_lr), get_ks(res_tmp$x2),
+          get_ks(res_tmp$x3),  get_ks(res_tmp$x4),   get_ks(res_tmp$x5),
+          get_ks(res_tmp$x6),  get_ks(res_tmp$x7),   get_ks(res_tmp$x8),
+          get_ks(res_tmp$x9),  get_ks(res_tmp$x10))
+  s2 <- c(get_cvm(res_tmp$x1), get_cvm(res_tmp$x_lr), get_cvm(res_tmp$x2),
+          get_cvm(res_tmp$x3), get_cvm(res_tmp$x4),   get_cvm(res_tmp$x5),
+          get_cvm(res_tmp$x6), get_cvm(res_tmp$x7),   get_cvm(res_tmp$x8),
+          get_cvm(res_tmp$x9), get_cvm(res_tmp$x10))
+
+  data.frame(ks = s1, cvm = s2,
+             row.names = c("ADD-SIS", "Log-rank SIS",
+                           "KS-Filter-M2", "DC-SIS-M2", "MV-SIS-M2",
+                           "KS-Filter-M1", "DC-SIS-M1", "MV-SIS-M1",
+                           "KS-Filter-M3", "DC-SIS-M3", "MV-SIS-M3"))
+}
+
+evaluate_all_metrics_adni <- function(sub) {
+  results <- run_parallel_loocv_adni(sub)
+
+  med_df <- data.frame(
+    x1   = results[["ADD-SIS"]][1, ],
+    x_lr = results[["Log-rank SIS"]][1, ],
+    x2   = results[["KS-Filter-M2"]][1, ],
+    x3   = results[["DC-SIS-M2"]][1, ],
+    x4   = results[["MV-SIS-M2"]][1, ],
+    x5   = results[["KS-Filter-M1"]][1, ],
+    x6   = results[["DC-SIS-M1"]][1, ],
+    x7   = results[["MV-SIS-M1"]][1, ],
+    x8   = results[["KS-Filter-M3"]][1, ],
+    x9   = results[["DC-SIS-M3"]][1, ],
+    x10  = results[["MV-SIS-M3"]][1, ]
+  )
+  kscvm <- loo_com_method_adni(med_df)
+  kscvm <- kscvm[names(results), ]
+
+  compute_interval_metrics <- function(pred_mat) {
+    max_r_scale <- max(r[is.finite(r)], na.rm = TRUE)
+    prec_vals <- sapply(seq_len(n_samples), function(i) {
+      true_r_val <- ifelse(is.infinite(r[i]), max_r_scale, r[i])
+      overlap1(l[i], true_r_val, pred_mat[2, i], pred_mat[3, i])
+    })
+    rec_vals <- sapply(seq_len(n_samples), function(i) {
+      true_r_val <- ifelse(is.infinite(r[i]), max_r_scale, r[i])
+      overlap2(l[i], true_r_val, pred_mat[2, i], pred_mat[3, i])
+    })
+    prec_vals[is.na(prec_vals)] <- 0
+    rec_vals[is.na(rec_vals)]   <- 0
+    prec <- mean(prec_vals)
+    rec  <- mean(rec_vals)
+    f1   <- ifelse((prec + rec) == 0, 0, 2 * prec * rec / (prec + rec))
+    widths    <- pred_mat[3, ] - pred_mat[2, ]
+    avg_width <- mean(widths[is.finite(widths) & widths >= 0], na.rm = TRUE)
+    c(Precision = prec, Recall = rec, F1 = f1, AvgWidth = avg_width)
+  }
+
+  int_metrics <- t(sapply(names(results),
+                          function(m) compute_interval_metrics(results[[m]])))
+
+  data.frame(
+    KSpred    = kscvm$ks,
+    CVMpred   = kscvm$cvm,
+    Precision = int_metrics[, "Precision"],
+    Recall    = int_metrics[, "Recall"],
+    F1        = int_metrics[, "F1"],
+    AvgWidth  = int_metrics[, "AvgWidth"],
+    row.names = names(results)
+  )
+}
+```
+
+
+## Run Final Evaluation
+```{r run_final_eval, warning=FALSE}
+cat("IC-Cox LOOCV | Full Summary Table (d = 50)\n")
+summary_adni_50 <- evaluate_all_metrics_adni(50)
+print(round(summary_adni_50, 4))
+```
+
+
+## Top SNP Analysis and CDF Figure
+```{r snp_analysis}
+d             <- 50
+rank_lr_adni  <- rank(-res_lr_adni$screen)
+rank_add_adni <- rank(-res_add_adni$screen)
+
+top_lr  <- snp_names[rank_lr_adni  <= d]
+top_add <- snp_names[rank_add_adni <= d]
+
+both_selected <- intersect(top_lr,  top_add)
+only_lr       <- setdiff(top_lr,    top_add)
+only_add      <- setdiff(top_add,   top_lr)
+
+cat("=== d =", d, "===\n")
+cat("Commonly selected:", length(both_selected), "\n")
+cat("Only Log-rank SIS:", length(only_lr),  "\n")
+cat("Only ADD-SIS:     ", length(only_add), "\n\n")
+
+cat("--- Top-20 SNPs unique to Log-rank SIS ---\n")
+diff_lr <- data.frame(
+  SNP      = only_lr,
+  LR_rank  = rank_lr_adni [snp_names %in% only_lr],
+  ADD_rank = rank_add_adni[snp_names %in% only_lr]
+)
+print(head(diff_lr[order(diff_lr$LR_rank), ], 20), row.names = FALSE)
+
+cat("\n--- Top-20 SNPs unique to ADD-SIS ---\n")
+diff_add <- data.frame(
+  SNP      = only_add,
+  LR_rank  = rank_lr_adni [snp_names %in% only_add],
+  ADD_rank = rank_add_adni[snp_names %in% only_add]
+)
+print(head(diff_add[order(diff_add$ADD_rank), ], 20), row.names = FALSE)
+```
+
+```{r top_snp_lrt}
+top1_snp <- snp_names[which.min(rank_lr_adni)]
+top1_x   <- as.integer(s[[top1_snp]])
+
+cat(sprintf("\nTop SNP: %s  |  alt allele (X=1) n=%d  |  ref allele (X=0) n=%d\n",
+            top1_snp, sum(top1_x), sum(1 - top1_x)))
+
+dt_lrt   <- data.frame(l = log(pmax(l, 0.5)), r = log(r), x = top1_x)
+fit_alt  <- suppressWarnings(tryCatch(
+  ic_sp(cbind(l, r) ~ x, data = dt_lrt, model = "ph"),
+  error = function(e) NULL))
+fit_null <- suppressWarnings(tryCatch(
+  ic_sp(cbind(l, r) ~ 1, data = dt_lrt, model = "ph"),
+  error = function(e) NULL))
+
+if (!is.null(fit_alt) && !is.null(fit_null)) {
+  lrt_stat <- 2 * (as.numeric(fit_alt$llk) - as.numeric(fit_null$llk))
+  lrt_p    <- pchisq(lrt_stat, df = 1, lower.tail = FALSE)
+  cat(sprintf("IC-Cox LRT statistic: %.4f  |  p-value: %.4g\n",
+              lrt_stat, lrt_p))
+} else {
+  cat("IC-Cox LRT could not be computed for top SNP.\n")
+}
+```
+
+```{r cdf_four_panel, fig.width=10, fig.height=9}
+plot_ic_cdf <- function(snp_name, x_mat, l, r, main_title,
+                        note_text = NULL,
+                        col0 = "steelblue", col1 = "tomato") {
+
+  x_k  <- x_mat[, snp_name]
+  idx1 <- which(x_k == 1)
+  idx0 <- which(x_k == 0)
+
+  supp_all <- sort(unique(c(
+    l[is.finite(l) & l > 0],
+    r[is.finite(r)]
+  )))
+  if (length(supp_all) < 2 || length(idx1) < 2 || length(idx0) < 2) {
+    plot.new()
+    title(main = main_title)
+    mtext("(insufficient data)", side = 3, cex = 0.75)
+    return(invisible(NULL))
+  }
+
+  p1 <- tryCatch(
+    turnbull_em_npmle(l[idx1], r[idx1], supp_all),
+    error = function(e) rep(0, length(supp_all))
+  )
+  p0 <- tryCatch(
+    turnbull_em_npmle(l[idx0], r[idx0], supp_all),
+    error = function(e) rep(0, length(supp_all))
+  )
+
+  F1 <- cumsum(p1)
+  F0 <- cumsum(p0)
+
+  t_plot <- c(0, supp_all)
+  F1_plot <- c(0, F1)
+  F0_plot <- c(0, F0)
+
+  maf_v <- round(min(mean(x_k), 1 - mean(x_k)), 4)
+
+  plot(t_plot, F0_plot, type = "s",
+       col = col0, lwd = 2.5,
+       ylim = c(0, 1),
+       xlab = "Time to Dementia (months)",
+       ylab = expression(italic(F)(italic(t)) == 1 - italic(S)(italic(t))),
+       main = main_title,
+       las  = 1, bty = "l")
+  lines(t_plot, F1_plot, type = "s", col = col1, lwd = 2.5)
+
+  legend("topleft",
+         legend = c(sprintf("Ref  X=0  (n = %d)", length(idx0)),
+                    sprintf("Alt  X=1  (n = %d)", length(idx1)),
+                    sprintf("MAF = %.4f", maf_v)),
+         col  = c(col0, col1, NA),
+         lwd  = c(2.5, 2.5, NA),
+         lty  = c(1, 1, NA),
+         bty  = "n", cex = 0.80)
+
+  if (!is.null(note_text))
+    mtext(note_text, side = 3, line = 0.25, cex = 0.70, col = "gray35")
+
+  invisible(NULL)
+}
+
+snp_freq_p1 <- colMeans(X_mat, na.rm = TRUE)
+snp_maf_p1  <- pmin(snp_freq_p1, 1 - snp_freq_p1)
+
+both_df <- data.frame(
+  SNP      = both_selected,
+  LR_rank  = rank_lr_adni [snp_names %in% both_selected],
+  ADD_rank = rank_add_adni[snp_names %in% both_selected]
+)
+both_df$sum_rank <- both_df$LR_rank + both_df$ADD_rank
+snp_a <- both_df$SNP[which.min(both_df$sum_rank)]
+
+only_lr_df <- data.frame(
+  SNP      = only_lr,
+  LR_rank  = rank_lr_adni [snp_names %in% only_lr],
+  ADD_rank = rank_add_adni[snp_names %in% only_lr],
+  MAF      = snp_maf_p1   [snp_names %in% only_lr]
+)
+lr_cand <- only_lr_df[only_lr_df$LR_rank <= 40 & only_lr_df$ADD_rank > 150, ]
+if (nrow(lr_cand) == 0) lr_cand <- only_lr_df[only_lr_df$LR_rank <= 50, ]
+snp_b <- lr_cand$SNP[which.min(lr_cand$MAF)]
+
+only_add_df <- data.frame(
+  SNP      = only_add,
+  LR_rank  = rank_lr_adni [snp_names %in% only_add],
+  ADD_rank = rank_add_adni[snp_names %in% only_add]
+)
+preferred_c <- "rs1895140_G"
+snp_c <- if (preferred_c %in% only_add) preferred_c else
+  only_add_df$SNP[which.max(only_add_df$LR_rank)]
+
+null_df <- data.frame(SNP = snp_names, LR_rank = rank_lr_adni,
+                      ADD_rank = rank_add_adni)
+null_cand <- null_df[null_df$LR_rank > 4000 & null_df$ADD_rank > 4000, ]
+set.seed(2025)
+snp_d <- if (nrow(null_cand) > 0) {
+  null_cand$SNP[sample(nrow(null_cand), 1)]
+} else {
+  null_df$SNP[which.max(null_df$LR_rank + null_df$ADD_rank)]
+}
+
+cat("=== Four-panel CDF figure: selected SNPs ===\n")
+for (nm in c("snp_a", "snp_b", "snp_c", "snp_d")) {
+  sv <- get(nm)
+  cat(sprintf("  %s [%s]:  LR_rank = %d  |  ADD_rank = %d  |  MAF = %.4f\n",
+              nm, sv,
+              rank_lr_adni [which(snp_names == sv)],
+              rank_add_adni[which(snp_names == sv)],
+              snp_maf_p1   [which(snp_names == sv)]))
+}
+
+op <- par(mfrow = c(2, 2),
+          mar   = c(4.2, 4.2, 4.0, 1.5),
+          oma   = c(0, 0, 2.5, 0))
+
+plot_ic_cdf(
+  snp_a, X_mat, l, r,
+  main_title = sprintf("(a) Consensus strong signal\n%s", snp_a),
+  note_text  = sprintf("LR rank %d  |  ADD rank %d",
+               rank_lr_adni [which(snp_names == snp_a)],
+               rank_add_adni[which(snp_names == snp_a)])
+)
+
+plot_ic_cdf(
+  snp_b, X_mat, l, r,
+  main_title = sprintf("(b) Log-rank unique — rare monotone signal\n%s", snp_b),
+  note_text  = sprintf("LR rank %d  |  ADD rank %d",
+               rank_lr_adni [which(snp_names == snp_b)],
+               rank_add_adni[which(snp_names == snp_b)])
+)
+
+plot_ic_cdf(
+  snp_c, X_mat, l, r,
+  main_title = sprintf("(c) ADD-SIS unique — crossing hazards\n%s", snp_c),
+  note_text  = sprintf("LR rank %d  |  ADD rank %d",
+               rank_lr_adni [which(snp_names == snp_c)],
+               rank_add_adni[which(snp_names == snp_c)])
+)
+
+plot_ic_cdf(
+  snp_d, X_mat, l, r,
+  main_title = sprintf("(d) Null baseline — no signal\n%s", snp_d),
+  note_text  = sprintf("LR rank %d  |  ADD rank %d",
+               rank_lr_adni [which(snp_names == snp_d)],
+               rank_add_adni[which(snp_names == snp_d)])
+)
+
+mtext("NPMLE Cumulative Incidence F(t) by SNP Genotype Group  (ADNI, Phase I)",
+      outer = TRUE, cex = 1.05, font = 2)
+
+par(op)
+```
