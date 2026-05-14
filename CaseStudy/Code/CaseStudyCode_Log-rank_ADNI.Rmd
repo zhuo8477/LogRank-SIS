@@ -192,6 +192,15 @@ screen_logrank_raw <- function(no, x_mat, g) {
   abs(U_n) / (p_hat_k * (1 - p_hat_k) + 1e-8)
 }
 
+# NOTE: The original ADD-SIS implementation (Zhong et al., 2023) relies on
+# Icens::initcomputeMLE for stratified NPMLE estimation. In the ADNI setting,
+# where the support set is larger (|A| = 112) and many SNPs have near-minimal
+# minor allele frequencies, subgroup-specific NPMLE fits occasionally fail to
+# converge. We therefore replace the backend with a custom EM routine and wrap
+# each stratified call in a tryCatch handler, returning a zero vector upon
+# failure. This adjustment improves numerical stability without altering the
+# algorithmic structure: each feature still requires two independent NPMLE fits,
+# preserving the O(p) time complexity of the original method.
 screen_add_adni <- function(no, x_mat, l, r) {
   x_k  <- x_mat[, no]
   idx1 <- which(x_k == 1); idx0 <- which(x_k == 0)
@@ -273,7 +282,6 @@ score4    <- sapply(seq_len(p_total), screen_mv, y = mid, x_mat = X_mat)
 res_mv_m2 <- data.frame(screen = score4); b <- Sys.time()
 print("MV-SIS-M2"); print(b - a)
 
-# M1 (1/3 proxy)
 a <- Sys.time()
 score5    <- sapply(seq_len(p_total), screen_ks, y = three, x_mat = X_mat)
 res_ks_m1 <- data.frame(screen = score5); b <- Sys.time()
@@ -289,7 +297,6 @@ score7    <- sapply(seq_len(p_total), screen_mv, y = three, x_mat = X_mat)
 res_mv_m1 <- data.frame(screen = score7); b <- Sys.time()
 print("MV-SIS-M1"); print(b - a)
 
-# M3 (2/3 proxy)
 a <- Sys.time()
 score8    <- sapply(seq_len(p_total), screen_ks, y = six, x_mat = X_mat)
 res_ks_m3 <- data.frame(screen = score8); b <- Sys.time()

@@ -61,6 +61,7 @@ LogRank-SIS/
 │
 ├── CaseStudy/                              # Real data applications (Section 4)
 │   ├── Code/
+│   │   ├── ADNI_Data_Preprocessing.R           # Section 4.3: ADNI data preprocessing
 │   │   ├── CaseStudyCode_Log-rank_Salary.Rmd   # Section 4.2: Job advertisement data
 │   │   └── CaseStudyCode_Log-rank_ADNI.Rmd     # Section 4.3: ADNI genetic data
 │   └── Data/                              # Salary dataset (see Data section below)
@@ -85,7 +86,7 @@ LogRank-SIS/
 
 ## Data
 
-### Job Advertisement Data
+###  Job Advertisement Data
 
 This dataset was originally collected and processed by Zhong et al. (2023).
 Please download it directly from their repository:
@@ -158,6 +159,15 @@ source("Simulation/Outlier_Case/Code/Outlier_Case.R")
 ```
 
 ### Case Studies (Section 4)
+
+Before running the ADNI case study, preprocess the raw ADNI data by running:
+
+```r
+source("CaseStudy/Code/ADNI_Data_Preprocessing.R")
+```
+
+This script processes the raw genotyping data downloaded from the ADNI portal
+and prepares the input required by `CaseStudyCode_Log-rank_ADNI.Rmd`.
 
 Open the following `.Rmd` files in **RStudio** and click **Knit**:
 
