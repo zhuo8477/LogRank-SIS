@@ -48,7 +48,7 @@ precompute_logrank_globals <- function(l, r) {
   p_hat <- turnbull_em_npmle(l, r, supp)
   active  <- p_hat > 1e-14
   supp_a  <- supp[active]
-  p_hat_a <- p_hat[active] / sum(p_hat[active])   
+  p_hat_a <- p_hat[active] / sum(p_hat[active])
   Ja      <- length(supp_a)
   alpha <- matrix(0L, n, Ja)
   for (i in seq_len(n)) {
@@ -57,37 +57,25 @@ precompute_logrank_globals <- function(l, r) {
     else if ( is.finite(li) && !is.finite(ri)) alpha[i, supp_a >  li               ] <- 1L
     else if (!is.finite(li) &&  is.finite(ri)) alpha[i,                supp_a <= ri] <- 1L
   }
-  list(supp = supp_a, p_hat = p_hat_a, alpha = alpha, J = Ja, n = n)
+  denom <- as.vector(alpha %*% p_hat_a)
+  denom[denom < 1e-14] <- 1e-14
+  w   <- sweep(alpha * matrix(p_hat_a, n, Ja, byrow = TRUE), 1, denom, "/")
+  d_j <- colSums(w)
+  n_j <- rev(cumsum(rev(d_j)))
+  list(supp = supp_a, p_hat = p_hat_a, alpha = alpha,
+       w = w, d_j = d_j, n_j = n_j, J = Ja, n = n)
 }
 
 screen_logrank_raw <- function(no, s, g) {
   x_k <- s[, no]
-  n   <- g$n
-  J   <- g$J
-  
   if (sum(x_k) < 2 || sum(1 - x_k) < 2) return(0)
-  
-  denom <- as.vector(g$alpha %*% g$p_hat)
-  denom[denom < 1e-14] <- 1e-14
-  
-  w    <- sweep(g$alpha * matrix(g$p_hat, n, J, byrow = TRUE), 1, denom, "/")
-  
-  d_j  <- colSums(w)                   
-  d_jk <- colSums(x_k * w)             
-  n_j  <- rev(cumsum(rev(d_j)))        
-  n_jk <- rev(cumsum(rev(d_jk)))       
-  
-  ok <- n_j > 1e-9
+  d_jk <- colSums(x_k * g$w)
+  n_jk <- rev(cumsum(rev(d_jk)))
+  ok   <- g$n_j > 1e-9
   if (sum(ok) == 0) return(0)
-  
-  U_n <- sum(d_jk[ok] - d_j[ok] * (n_jk[ok] / n_j[ok])) / n
-  
+  U_n     <- sum(d_jk[ok] - g$d_j[ok] * (n_jk[ok] / g$n_j[ok])) / g$n
   p_hat_k <- mean(x_k)
-  var_x   <- p_hat_k * (1 - p_hat_k)
-  
-  adjusted_score <- abs(U_n) / (var_x + 1e-8)
-  
-  return(adjusted_score)
+  abs(U_n) / (p_hat_k * (1 - p_hat_k) + 1e-8)
 }
 
 screen_npmle1 <- function(i,l,r,s,basis){

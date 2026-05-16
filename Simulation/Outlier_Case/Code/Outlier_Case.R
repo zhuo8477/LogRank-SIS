@@ -137,7 +137,7 @@ precompute_logrank_globals <- function(l, r) {
   p_hat <- turnbull_em_npmle(l, r, supp)
   active  <- p_hat > 1e-14
   supp_a  <- supp[active]
-  p_hat_a <- p_hat[active] / sum(p_hat[active])   
+  p_hat_a <- p_hat[active] / sum(p_hat[active])
   Ja      <- length(supp_a)
   alpha <- matrix(0L, n, Ja)
   for (i in seq_len(n)) {
@@ -146,38 +146,25 @@ precompute_logrank_globals <- function(l, r) {
     else if ( is.finite(li) && !is.finite(ri)) alpha[i, supp_a >  li               ] <- 1L
     else if (!is.finite(li) &&  is.finite(ri)) alpha[i,                supp_a <= ri] <- 1L
   }
-  list(supp = supp_a, p_hat = p_hat_a, alpha = alpha, J = Ja, n = n)
+  denom <- as.vector(alpha %*% p_hat_a)
+  denom[denom < 1e-14] <- 1e-14
+  w   <- sweep(alpha * matrix(p_hat_a, n, Ja, byrow = TRUE), 1, denom, "/")
+  d_j <- colSums(w)
+  n_j <- rev(cumsum(rev(d_j)))
+  list(supp = supp_a, p_hat = p_hat_a, alpha = alpha,
+       w = w, d_j = d_j, n_j = n_j, J = Ja, n = n)
 }
 
 screen_logrank <- function(no, s, g) {
   x_k <- s[, no]
-  n   <- g$n
-  J   <- g$J
-  
-  # 极度稀疏的特征直接过滤
   if (sum(x_k) < 2 || sum(1 - x_k) < 2) return(0)
-  
-  denom <- as.vector(g$alpha %*% g$p_hat)
-  denom[denom < 1e-14] <- 1e-14
-  
-  w    <- sweep(g$alpha * matrix(g$p_hat, n, J, byrow = TRUE), 1, denom, "/")
-  
-  d_j  <- colSums(w)                   
-  d_jk <- colSums(x_k * w)             
-  n_j  <- rev(cumsum(rev(d_j)))        
-  n_jk <- rev(cumsum(rev(d_jk)))       
-  
-  ok <- n_j > 1e-9
+  d_jk <- colSums(x_k * g$w)
+  n_jk <- rev(cumsum(rev(d_jk)))
+  ok   <- g$n_j > 1e-9
   if (sum(ok) == 0) return(0)
-  
-  U_n <- sum(d_jk[ok] - d_j[ok] * (n_jk[ok] / n_j[ok])) / n
-  
+  U_n     <- sum(d_jk[ok] - g$d_j[ok] * (n_jk[ok] / g$n_j[ok])) / g$n
   p_hat_k <- mean(x_k)
-  var_x   <- p_hat_k * (1 - p_hat_k)
-  
-  adjusted_score <- abs(U_n) / (var_x + 1e-8)
-  
-  return(adjusted_score)
+  abs(U_n) / (p_hat_k * (1 - p_hat_k) + 1e-8)
 }
 
 int_split <- function(i,df){
@@ -491,133 +478,6 @@ clusterEvalQ(cl, {
   library(energy)
   library(dplyr)
 })
-
-cat("开始运行Outlier模拟...\n")
-cat("模拟次数:", n_sim, "\n")
-cat("使用核心数:", num_cores, "\n")
-
-# 执行8种组合的模拟 (2种异常值 × 2种平衡性 × 2种删失比例)
-results_list <- list()
-
-counter <- 1
-for (outlier_type in 1:2) {
-  for (balanced in c(TRUE, FALSE)) {
-    for (rat in c(0.3, 0.7)) {
-      cat(sprintf("运行Outlier Case %d, Balanced=%s, Rat=%.1f\n", 
-                  outlier_type, balanced, rat))
-      
-      res <- run_simulation_outlier_parallel(
-        1:n_sim, 
-        outlier_type = outlier_type,
-        pp = sigma1, 
-        nn = 200, 
-        rat = rat, 
-        balanced = balanced
-      )
-      
-      results_list[[counter]] <- list(
-        outlier_type = outlier_type,
-        balanced = balanced,
-        rat = rat,
-        result = res
-      )
-      
-      filename <- sprintf("Outlier_Case%d_Bal%s_Rat%.1f.csv", 
-                          outlier_type, balanced, rat)
-      write.csv(res, file.path(output_dir, filename))
-      
-      counter <- counter + 1
-    }
-  }
-}
-
-# 关闭集群
-stopCluster(cl)
-
-# ==============================================================================
-# 6. 结果分析 - 按照论文极简精炼格式提取最优 Baseline (M1)
-# ==============================================================================
-
-# 定义方法名称和对应的行索引 (已修正 M1/M2 映射，并仅保留核心方法)
-# d3, e3, f3 (行号 36-50) 对应 y_3 (下三分之一点 M1)
-method_rows <- list(
-  "Log-Rank"    = list(rows = 16:20, method_name = "Log-Rank"),
-  "ADD-SIS"     = list(rows = 1:5,   method_name = "ADD-SIS"),
-  "DC-SIS (M1)" = list(rows = 41:45, method_name = "DC-SIS (M1)"),
-  "KF (M1)"     = list(rows = 36:40, method_name = "KF (M1)"),
-  "MV-SIS (M1)" = list(rows = 46:50, method_name = "MV-SIS (M1)")
-)
-
-# 计算MMS和RSD的函数
-calculate_mms_rsd <- function(res, rows, n_sim) {
-  # 提取指定行的数据
-  if (nrow(res) > 65) {
-    res_subset <- res[rows, ]
-  } else {
-    res_subset <- res
-  }
-  
-  # 计算每次模拟的最大排名
-  max_ranks <- sapply(1:n_sim, function(i) max(res_subset[, i], na.rm = TRUE))
-  
-  # 计算中位数和IQR
-  median_val <- median(max_ranks, na.rm = TRUE)
-  iqr_val <- IQR(max_ranks, na.rm = TRUE)
-  
-  # 计算稳健标准差
-  rsd_val <- iqr_val / 1.34
-  
-  # 返回格式化的字符串
-  return(sprintf("%.1f(%.1f)", median_val, rsd_val))
-}
-
-# 创建结果表格
-create_result_table <- function(results_list, outlier_case, n_sim) {
-  # 筛选指定异常值类型的结果
-  case_results <- results_list[sapply(results_list, function(x) x$outlier_type == outlier_case)]
-  
-  # 定义四种情形
-  scenarios <- list(
-    "Case1_Balanced" = list(rat = 0.3, balanced = TRUE),
-    "Case1_Unbalanced" = list(rat = 0.3, balanced = FALSE),
-    "Case2_Balanced" = list(rat = 0.7, balanced = TRUE),
-    "Case2_Unbalanced" = list(rat = 0.7, balanced = FALSE)
-  )
-  
-  # 创建空表格
-  table_data <- data.frame(
-    Method = names(method_rows),
-    Case1_Balanced = character(length(method_rows)),
-    Case1_Unbalanced = character(length(method_rows)),
-    Case2_Balanced = character(length(method_rows)),
-    Case2_Unbalanced = character(length(method_rows)),
-    stringsAsFactors = FALSE
-  )
-  
-  # 填充表格
-  for (i in 1:length(method_rows)) {
-    method_name <- names(method_rows)[i]
-    rows <- method_rows[[method_name]]$rows
-    
-    for (scenario_name in names(scenarios)) {
-      scenario <- scenarios[[scenario_name]]
-      
-      # 找到对应的结果
-      result_idx <- which(sapply(case_results, function(x) 
-        x$rat == scenario$rat & x$balanced == scenario$balanced))
-      
-      if (length(result_idx) > 0) {
-        res <- case_results[[result_idx]]$result
-        table_data[i, scenario_name] <- calculate_mms_rsd(res, rows, n_sim)
-      } else {
-        table_data[i, scenario_name] <- "NA"
-      }
-    }
-  }
-  
-  return(table_data)
-}
-
 
 cat("Running Outlier parallel simulations...\n")
 cat("Replications:", n_sim, "\n")
